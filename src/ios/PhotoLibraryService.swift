@@ -64,6 +64,175 @@ final class PhotoLibraryService {
 
     let assetCollectionTypes = [PHAssetCollectionType.album, PHAssetCollectionType.smartAlbum/*, PHAssetCollectionType.moment*/]
 
+    struct PictureData {
+        var data: Data
+        var mimeType: String
+    }
+
+    // TODO: currently seems useless
+    enum PhotoLibraryError: Error, CustomStringConvertible {
+        case error(description: String)
+
+        var description: String {
+            switch self {
+            case .error(let description): return description
+            }
+        }
+    }
+
+    fileprivate func getDataFromURL(_ url: String) throws -> Data {
+        if url.hasPrefix("data:") {
+
+            guard let match = self.dataURLPattern.firstMatch(in: url, options: NSRegularExpression.MatchingOptions(rawValue: 0), range: NSMakeRange(0, url.count)) else { // TODO: firstMatchInString seems to be slow for unknown reason
+                throw PhotoLibraryError.error(description: "The dataURL could not be parsed")
+            }
+            let dataPos = match.range(at: 0).length
+            let base64 = (url as NSString).substring(from: dataPos)
+            guard let decoded = Data(base64Encoded: base64, options: NSData.Base64DecodingOptions(rawValue: 0)) else {
+                throw PhotoLibraryError.error(description: "The dataURL could not be decoded")
+            }
+
+            return decoded
+
+        } else {
+
+            guard let nsURL = URL(string: url) else {
+                throw PhotoLibraryError.error(description: "The url could not be decoded: \(url)")
+            }
+            guard let fileContent = try? Data(contentsOf: nsURL) else {
+                throw PhotoLibraryError.error(description: "The url could not be read: \(url)")
+            }
+
+            return fileContent
+
+        }
+    }
+
+    fileprivate func putMediaToAlbum(_ assetsLibrary: ALAssetsLibrary, url: URL, album: String, completion: @escaping (_ error: String?)->Void) {
+
+        assetsLibrary.asset(for: url, resultBlock: { (asset: ALAsset?) in
+
+            guard let asset = asset else {
+                completion("Retrieved asset is nil")
+                return
+            }
+
+            PhotoLibraryService.getAlPhotoAlbum(assetsLibrary, album: album, completion: { (alPhotoAlbum: ALAssetsGroup?, error: String?) in
+
+                if error != nil {
+                    completion("getting photo album caused error: \(error)")
+                    return
+                }
+
+                alPhotoAlbum!.add(asset)
+                completion(nil)
+
+            })
+
+        }, failureBlock: { (error: Error?) in
+            completion("Could not retrieve saved asset: \(error)")
+        })
+
+    }
+
+    fileprivate static func image2PictureData(_ image: UIImage, quality: Float) -> PictureData? {
+        //        This returns raw data, but mime type is unknown. Anyway, crodova performs base64 for messageAsArrayBuffer, so there's no performance gain visible
+        //        let provider: CGDataProvider = CGImageGetDataProvider(image.CGImage)!
+        //        let data = CGDataProviderCopyData(provider)
+        //        return data;
+
+        var data: Data?
+        var mimeType: String?
+
+        if (imageHasAlpha(image)){
+            data = UIImagePNGRepresentation(image)
+            mimeType = data != nil ? "image/png" : nil
+        } else {
+            data = UIImageJPEGRepresentation(image, CGFloat(quality))
+            mimeType = data != nil ? "image/jpeg" : nil
+        }
+
+        if data != nil && mimeType != nil {
+            return PictureData(data: data!, mimeType: mimeType!)
+        }
+        return nil
+    }
+
+    fileprivate static func imageHasAlpha(_ image: UIImage) -> Bool {
+        let alphaInfo = (image.cgImage)?.alphaInfo
+        return alphaInfo == .first || alphaInfo == .last || alphaInfo == .premultipliedFirst || alphaInfo == .premultipliedLast
+    }
+
+    fileprivate static func getPhotoAlbum(_ album: String) -> PHAssetCollection? {
+
+        let fetchOptions = PHFetchOptions()
+        fetchOptions.predicate = NSPredicate(format: "title = %@", album)
+        let fetchResult = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: fetchOptions)
+        guard let photoAlbum = fetchResult.firstObject else {
+            return nil
+        }
+
+        return photoAlbum
+
+    }
+
+    fileprivate static func createPhotoAlbum(_ album: String, completion: @escaping (_ photoAlbum: PHAssetCollection?, _ error: String?)->()) {
+
+        var albumPlaceholder: PHObjectPlaceholder?
+
+        PHPhotoLibrary.shared().performChanges({
+
+            let createAlbumRequest = PHAssetCollectionChangeRequest.creationRequestForAssetCollection(withTitle: album)
+            albumPlaceholder = createAlbumRequest.placeholderForCreatedAssetCollection
+
+        }) { success, error in
+
+            guard let placeholder = albumPlaceholder else {
+                completion(nil, "Album placeholder is nil")
+                return
+            }
+
+            let fetchResult = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [placeholder.localIdentifier], options: nil)
+
+            guard let photoAlbum = fetchResult.firstObject else {
+                completion(nil, "FetchResult has no PHAssetCollection")
+                return
+            }
+
+            if success {
+                completion(photoAlbum, nil)
+            }
+            else {
+                completion(nil, "\(error)")
+            }
+        }
+    }
+
+    fileprivate static func getAlPhotoAlbum(_ assetsLibrary: ALAssetsLibrary, album: String, completion: @escaping (_ alPhotoAlbum: ALAssetsGroup?, _ error: String?)->Void) {
+
+        var groupPlaceHolder: ALAssetsGroup?
+
+        assetsLibrary.enumerateGroupsWithTypes(ALAssetsGroupAlbum, usingBlock: { (group: ALAssetsGroup?, _ ) in
+
+            guard let group = group else { // done enumerating
+                guard let groupPlaceHolder = groupPlaceHolder else {
+                    completion(nil, "Could not find album")
+                    return
+                }
+                completion(groupPlaceHolder, nil)
+                return
+            }
+
+            if group.value(forProperty: ALAssetsGroupPropertyName) as? String == album {
+                groupPlaceHolder = group
+            }
+
+        }, failureBlock: { (error: Error?) in
+            completion(nil, "Could not enumerate assets library")
+        })
+
+    }
+
     fileprivate init() {
         fetchOptions = PHFetchOptions()
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
@@ -572,7 +741,7 @@ final class PhotoLibraryService {
         // Permission was manually denied by user, open settings screen
         let settingsUrl = URL(string: UIApplicationOpenSettingsURLString)
         if let url = settingsUrl {
-            UIApplication.shared.openURL(url)
+            UIApplication.shared.openURL(url, options: [:], completionHandler: nil)
             // TODO: run callback only when return ?
             // Do not call success, as the app will be restarted when user changes permission
         } else {
@@ -721,175 +890,6 @@ final class PhotoLibraryService {
             saveVideo(photoAlbum)
 
         }
-
-    }
-
-    struct PictureData {
-        var data: Data
-        var mimeType: String
-    }
-
-    // TODO: currently seems useless
-    enum PhotoLibraryError: Error, CustomStringConvertible {
-        case error(description: String)
-
-        var description: String {
-            switch self {
-            case .error(let description): return description
-            }
-        }
-    }
-
-    fileprivate func getDataFromURL(_ url: String) throws -> Data {
-        if url.hasPrefix("data:") {
-
-            guard let match = self.dataURLPattern.firstMatch(in: url, options: NSRegularExpression.MatchingOptions(rawValue: 0), range: NSMakeRange(0, url.count)) else { // TODO: firstMatchInString seems to be slow for unknown reason
-                throw PhotoLibraryError.error(description: "The dataURL could not be parsed")
-            }
-            let dataPos = match.range(at: 0).length
-            let base64 = (url as NSString).substring(from: dataPos)
-            guard let decoded = Data(base64Encoded: base64, options: NSData.Base64DecodingOptions(rawValue: 0)) else {
-                throw PhotoLibraryError.error(description: "The dataURL could not be decoded")
-            }
-
-            return decoded
-
-        } else {
-
-            guard let nsURL = URL(string: url) else {
-                throw PhotoLibraryError.error(description: "The url could not be decoded: \(url)")
-            }
-            guard let fileContent = try? Data(contentsOf: nsURL) else {
-                throw PhotoLibraryError.error(description: "The url could not be read: \(url)")
-            }
-
-            return fileContent
-
-        }
-    }
-
-    fileprivate func putMediaToAlbum(_ assetsLibrary: ALAssetsLibrary, url: URL, album: String, completion: @escaping (_ error: String?)->Void) {
-
-        assetsLibrary.asset(for: url, resultBlock: { (asset: ALAsset?) in
-
-            guard let asset = asset else {
-                completion("Retrieved asset is nil")
-                return
-            }
-
-            PhotoLibraryService.getAlPhotoAlbum(assetsLibrary, album: album, completion: { (alPhotoAlbum: ALAssetsGroup?, error: String?) in
-
-                if error != nil {
-                    completion("getting photo album caused error: \(error)")
-                    return
-                }
-
-                alPhotoAlbum!.add(asset)
-                completion(nil)
-
-            })
-
-        }, failureBlock: { (error: Error?) in
-            completion("Could not retrieve saved asset: \(error)")
-        })
-
-    }
-
-    fileprivate static func image2PictureData(_ image: UIImage, quality: Float) -> PictureData? {
-        //        This returns raw data, but mime type is unknown. Anyway, crodova performs base64 for messageAsArrayBuffer, so there's no performance gain visible
-        //        let provider: CGDataProvider = CGImageGetDataProvider(image.CGImage)!
-        //        let data = CGDataProviderCopyData(provider)
-        //        return data;
-
-        var data: Data?
-        var mimeType: String?
-
-        if (imageHasAlpha(image)){
-            data = UIImagePNGRepresentation(image)
-            mimeType = data != nil ? "image/png" : nil
-        } else {
-            data = UIImageJPEGRepresentation(image, CGFloat(quality))
-            mimeType = data != nil ? "image/jpeg" : nil
-        }
-
-        if data != nil && mimeType != nil {
-            return PictureData(data: data!, mimeType: mimeType!)
-        }
-        return nil
-    }
-
-    fileprivate static func imageHasAlpha(_ image: UIImage) -> Bool {
-        let alphaInfo = (image.cgImage)?.alphaInfo
-        return alphaInfo == .first || alphaInfo == .last || alphaInfo == .premultipliedFirst || alphaInfo == .premultipliedLast
-    }
-
-    fileprivate static func getPhotoAlbum(_ album: String) -> PHAssetCollection? {
-
-        let fetchOptions = PHFetchOptions()
-        fetchOptions.predicate = NSPredicate(format: "title = %@", album)
-        let fetchResult = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: fetchOptions)
-        guard let photoAlbum = fetchResult.firstObject else {
-            return nil
-        }
-
-        return photoAlbum
-
-    }
-
-    fileprivate static func createPhotoAlbum(_ album: String, completion: @escaping (_ photoAlbum: PHAssetCollection?, _ error: String?)->()) {
-
-        var albumPlaceholder: PHObjectPlaceholder?
-
-        PHPhotoLibrary.shared().performChanges({
-
-            let createAlbumRequest = PHAssetCollectionChangeRequest.creationRequestForAssetCollection(withTitle: album)
-            albumPlaceholder = createAlbumRequest.placeholderForCreatedAssetCollection
-
-        }) { success, error in
-
-            guard let placeholder = albumPlaceholder else {
-                completion(nil, "Album placeholder is nil")
-                return
-            }
-
-            let fetchResult = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [placeholder.localIdentifier], options: nil)
-
-            guard let photoAlbum = fetchResult.firstObject else {
-                completion(nil, "FetchResult has no PHAssetCollection")
-                return
-            }
-
-            if success {
-                completion(photoAlbum, nil)
-            }
-            else {
-                completion(nil, "\(error)")
-            }
-        }
-    }
-
-    fileprivate static func getAlPhotoAlbum(_ assetsLibrary: ALAssetsLibrary, album: String, completion: @escaping (_ alPhotoAlbum: ALAssetsGroup?, _ error: String?)->Void) {
-
-        var groupPlaceHolder: ALAssetsGroup?
-
-        assetsLibrary.enumerateGroupsWithTypes(ALAssetsGroupAlbum, usingBlock: { (group: ALAssetsGroup?, _ ) in
-
-            guard let group = group else { // done enumerating
-                guard let groupPlaceHolder = groupPlaceHolder else {
-                    completion(nil, "Could not find album")
-                    return
-                }
-                completion(groupPlaceHolder, nil)
-                return
-            }
-
-            if group.value(forProperty: ALAssetsGroupPropertyName) as? String == album {
-                groupPlaceHolder = group
-            }
-
-        }, failureBlock: { (error: Error?) in
-            completion(nil, "Could not enumerate assets library")
-        })
 
     }
 
